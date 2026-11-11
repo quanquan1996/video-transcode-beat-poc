@@ -1,26 +1,108 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Video transcode + beat-tracking POC. S3 upload -> EventBridge -> Step Functions, three parallel branches:
-  (A) MediaConvert 720p, (B) beat_this on Fargate, (C) segmented ffmpeg on Fargate + concat (comparison).
+  Video transcode + beat-tracking POC. S3 -> Step Functions; side-by-side routes:
+  MediaConvert, ECS Fargate (CPU), Lambda x86 / arm64, ECS on GPU EC2 (NVDEC/NVENC). Generated file.
 
 Parameters:
   SegmentCount:
     Type: Number
     Default: 8
-    Description: Number of parallel ffmpeg slices for branch C.
+    Description: Parallel ffmpeg slices on Fargate.
+  LambdaSegments:
+    Type: Number
+    Default: 16
+    Description: Parallel ffmpeg slices on Lambda.
   SegmentCpu:
     Type: String
     Default: "8192"
     AllowedValues: ["2048", "4096", "8192", "16384"]
-  McAcceleration:
-    Type: String
-    Default: PREFERRED
-    AllowedValues: [DISABLED, PREFERRED, ENABLED]
-    Description: MediaConvert Accelerated transcoding (Professional tier) - much faster for 4K/8K sources.
   BeatCpu:
     Type: String
     Default: "4096"
     AllowedValues: ["1024", "2048", "4096", "8192"]
+  McAcceleration:
+    Type: String
+    Default: PREFERRED
+    AllowedValues: [DISABLED, PREFERRED, ENABLED]
+    Description: MediaConvert Accelerated transcoding (Professional tier).
+  LambdaReady:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Set to true once the Lambda images exist in ECR (deploy.sh handles this).
+  GpuDesired:
+    Type: String
+    Default: "0"
+    AllowedValues: ["0", "1"]
+    Description: Instances per GPU slot (1 while testing, 0 to stop paying).
+  Gpu1Type:
+    Type: String
+    Default: ""
+    Description: GPU slot 1 instance type (empty = off), e.g. g6.xlarge
+  Gpu1Gpus:
+    Type: String
+    Default: "1"
+    Description: GPUs per task for slot 1 ("1", or 0.125 / 0.25 / 0.5 for g6f fractional GPUs)
+  Gpu1Streams:
+    Type: String
+    Default: "4"
+    Description: Parallel slices of one video on the slot 1 GPU (lower it for small-memory fractional GPUs)
+  Gpu2Type:
+    Type: String
+    Default: ""
+    Description: GPU slot 2 instance type (empty = off), e.g. g6.xlarge
+  Gpu2Gpus:
+    Type: String
+    Default: "1"
+    Description: GPUs per task for slot 2 ("1", or 0.125 / 0.25 / 0.5 for g6f fractional GPUs)
+  Gpu2Streams:
+    Type: String
+    Default: "4"
+    Description: Parallel slices of one video on the slot 2 GPU (lower it for small-memory fractional GPUs)
+  Gpu3Type:
+    Type: String
+    Default: ""
+    Description: GPU slot 3 instance type (empty = off), e.g. g6.xlarge
+  Gpu3Gpus:
+    Type: String
+    Default: "1"
+    Description: GPUs per task for slot 3 ("1", or 0.125 / 0.25 / 0.5 for g6f fractional GPUs)
+  Gpu3Streams:
+    Type: String
+    Default: "4"
+    Description: Parallel slices of one video on the slot 3 GPU (lower it for small-memory fractional GPUs)
+  Gpu4Type:
+    Type: String
+    Default: ""
+    Description: GPU slot 4 instance type (empty = off), e.g. g6.xlarge
+  Gpu4Gpus:
+    Type: String
+    Default: "1"
+    Description: GPUs per task for slot 4 ("1", or 0.125 / 0.25 / 0.5 for g6f fractional GPUs)
+  Gpu4Streams:
+    Type: String
+    Default: "4"
+    Description: Parallel slices of one video on the slot 4 GPU (lower it for small-memory fractional GPUs)
+  Gpu5Type:
+    Type: String
+    Default: ""
+    Description: GPU slot 5 instance type (empty = off), e.g. g6.xlarge
+  Gpu5Gpus:
+    Type: String
+    Default: "1"
+    Description: GPUs per task for slot 5 ("1", or 0.125 / 0.25 / 0.5 for g6f fractional GPUs)
+  Gpu5Streams:
+    Type: String
+    Default: "4"
+    Description: Parallel slices of one video on the slot 5 GPU (lower it for small-memory fractional GPUs)
+
+Conditions:
+  LambdaOn: !Equals [!Ref LambdaReady, "true"]
+  HasGpu1: !Not [!Equals [!Ref Gpu1Type, ""]]
+  HasGpu2: !Not [!Equals [!Ref Gpu2Type, ""]]
+  HasGpu3: !Not [!Equals [!Ref Gpu3Type, ""]]
+  HasGpu4: !Not [!Equals [!Ref Gpu4Type, ""]]
+  HasGpu5: !Not [!Equals [!Ref Gpu5Type, ""]]
 
 Mappings:
   Mem:  # Fargate memory per CPU size (2 GB / vCPU)
@@ -31,7 +113,7 @@ Mappings:
     "16384": {MB: "32768"}
 
 Resources:
-  # ---------- network: small VPC with public subnets (tasks only need egress to S3/ECR) ----------
+  # ---------- network: public subnets, no NAT (tasks only need egress) ----------
   Vpc:
     Type: AWS::EC2::VPC
     Properties: {CidrBlock: 10.42.0.0/16, EnableDnsHostnames: true, EnableDnsSupport: true,
@@ -53,7 +135,7 @@ Resources:
     Properties: {RouteTableId: !Ref Rt, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref Igw}
   RtA: {Type: AWS::EC2::SubnetRouteTableAssociation, Properties: {SubnetId: !Ref SubnetA, RouteTableId: !Ref Rt}}
   RtB: {Type: AWS::EC2::SubnetRouteTableAssociation, Properties: {SubnetId: !Ref SubnetB, RouteTableId: !Ref Rt}}
-  S3Endpoint:  # S3 traffic stays on the AWS network and costs nothing
+  S3Endpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties: {VpcId: !Ref Vpc, ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3", RouteTableIds: [!Ref Rt]}
   TaskSg:
@@ -72,7 +154,7 @@ Resources:
     Type: AWS::ECR::Repository
     Properties: {RepositoryName: !Sub "${AWS::StackName}-worker", EmptyOnDelete: true}
 
-  # ---------- image build (CloudShell has no Docker, so CodeBuild builds the image) ----------
+  # ---------- image builds (CloudShell has no Docker): x86 builds ECS + Lambda-x86, arm builds Lambda-arm64 ----------
   BuildRole:
     Type: AWS::IAM::Role
     Properties:
@@ -86,10 +168,10 @@ Resources:
               - {Effect: Allow, Action: [ecr:BatchCheckLayerAvailability, ecr:InitiateLayerUpload, ecr:UploadLayerPart,
                                           ecr:CompleteLayerUpload, ecr:PutImage, ecr:BatchGetImage], Resource: !GetAtt Repo.Arn}
               - {Effect: Allow, Action: [s3:GetObject, s3:GetObjectVersion], Resource: !Sub "${Bucket.Arn}/build/*"}
-  Build:
+  BuildX86:
     Type: AWS::CodeBuild::Project
     Properties:
-      Name: !Sub "${AWS::StackName}-build"
+      Name: !Sub "${AWS::StackName}-build-x86"
       ServiceRole: !GetAtt BuildRole.Arn
       Source: {Type: S3, Location: !Sub "${Bucket}/build/src.zip", BuildSpec: container/buildspec.yml}
       Artifacts: {Type: NO_ARTIFACTS}
@@ -98,9 +180,22 @@ Resources:
         ComputeType: BUILD_GENERAL1_MEDIUM
         Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
         PrivilegedMode: true
-        EnvironmentVariables: [{Name: REPO_URI, Value: !GetAtt Repo.RepositoryUri}]
+        EnvironmentVariables: [{Name: REPO_URI, Value: !GetAtt Repo.RepositoryUri}, {Name: ARCH, Value: x86}]
+  BuildArm:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-build-arm64"
+      ServiceRole: !GetAtt BuildRole.Arn
+      Source: {Type: S3, Location: !Sub "${Bucket}/build/src.zip", BuildSpec: container/buildspec.yml}
+      Artifacts: {Type: NO_ARTIFACTS}
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/amazonlinux2-aarch64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables: [{Name: REPO_URI, Value: !GetAtt Repo.RepositoryUri}, {Name: ARCH, Value: arm64}]
 
-  # ---------- ECS / Fargate ----------
+  # ---------- ECS ----------
   Cluster: {Type: AWS::ECS::Cluster, Properties: {ClusterName: !Ref AWS::StackName}}
   Logs: {Type: AWS::Logs::LogGroup, Properties: {LogGroupName: !Sub "/poc/${AWS::StackName}", RetentionInDays: 14}}
   ExecRole:
@@ -111,7 +206,8 @@ Resources:
   TaskRole:
     Type: AWS::IAM::Role
     Properties:
-      AssumeRolePolicyDocument: {Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: sts:AssumeRole}]}
+      AssumeRolePolicyDocument: {Statement: [{Effect: Allow, Principal: {Service: [ecs-tasks.amazonaws.com, lambda.amazonaws.com]}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
       Policies:
         - PolicyName: s3
           PolicyDocument:
@@ -131,7 +227,7 @@ Resources:
       RuntimePlatform: {CpuArchitecture: X86_64, OperatingSystemFamily: LINUX}
       ContainerDefinitions:
         - Name: worker
-          Image: !Sub "${Repo.RepositoryUri}:latest"
+          Image: !Sub "${Repo.RepositoryUri}:ecs"
           LogConfiguration: {LogDriver: awslogs, Options: {awslogs-group: !Ref Logs, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: beat}}
   SegTask:
     Type: AWS::ECS::TaskDefinition
@@ -146,7 +242,7 @@ Resources:
       RuntimePlatform: {CpuArchitecture: X86_64, OperatingSystemFamily: LINUX}
       ContainerDefinitions:
         - Name: worker
-          Image: !Sub "${Repo.RepositoryUri}:latest"
+          Image: !Sub "${Repo.RepositoryUri}:ecs"
           LogConfiguration: {LogDriver: awslogs, Options: {awslogs-group: !Ref Logs, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: seg}}
   ConcatTask:
     Type: AWS::ECS::TaskDefinition
@@ -161,8 +257,265 @@ Resources:
       RuntimePlatform: {CpuArchitecture: X86_64, OperatingSystemFamily: LINUX}
       ContainerDefinitions:
         - Name: worker
-          Image: !Sub "${Repo.RepositoryUri}:latest"
+          Image: !Sub "${Repo.RepositoryUri}:ecs"
           LogConfiguration: {LogDriver: awslogs, Options: {awslogs-group: !Ref Logs, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: concat}}
+
+  # ---------- GPU EC2 capacity (one optional ASG per slot) ----------
+  GpuRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  GpuProfile: {Type: AWS::IAM::InstanceProfile, Properties: {Roles: [!Ref GpuRole]}}
+
+  GpuLt1:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: HasGpu1
+    Properties:
+      LaunchTemplateData:
+        ImageId: "{{resolve:ssm:/aws/service/ecs/optimized-ami/amazon-linux-2023/gpu/recommended/image_id}}"
+        InstanceType: !Ref Gpu1Type
+        IamInstanceProfile: {Arn: !GetAtt GpuProfile.Arn}
+        SecurityGroupIds: [!Ref TaskSg]
+        BlockDeviceMappings: [{DeviceName: /dev/xvda, Ebs: {VolumeSize: 80, VolumeType: gp3}}]
+        MetadataOptions: {HttpTokens: required}
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo ECS_CLUSTER=${Cluster} >> /etc/ecs/ecs.config
+        TagSpecifications: [{ResourceType: instance, Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-${Gpu1Type}"}]}]
+  GpuAsg1:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Condition: HasGpu1
+    UpdatePolicy:
+      AutoScalingReplacingUpdate: {WillReplace: true}
+    Properties:
+      MinSize: "0"
+      MaxSize: "1"
+      DesiredCapacity: !Ref GpuDesired
+      VPCZoneIdentifier: [!Ref SubnetA, !Ref SubnetB]
+      LaunchTemplate: {LaunchTemplateId: !Ref GpuLt1, Version: !GetAtt GpuLt1.LatestVersionNumber}
+  GpuTask1:
+    Type: AWS::ECS::TaskDefinition
+    Condition: HasGpu1
+    Properties:
+      Family: !Sub "${AWS::StackName}-gpu1"
+      RequiresCompatibilities: [EC2]
+      NetworkMode: bridge
+      Cpu: "3072"
+      Memory: "12288"
+      ExecutionRoleArn: !GetAtt ExecRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Sub "${Repo.RepositoryUri}:ecs"
+          ResourceRequirements: [{Type: GPU, Value: !Ref Gpu1Gpus}]
+          Environment: [{Name: NVIDIA_DRIVER_CAPABILITIES, Value: all}]
+          LogConfiguration: {LogDriver: awslogs, Options: {awslogs-group: !Ref Logs, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: gpu1}}
+  GpuLt2:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: HasGpu2
+    Properties:
+      LaunchTemplateData:
+        ImageId: "{{resolve:ssm:/aws/service/ecs/optimized-ami/amazon-linux-2023/gpu/recommended/image_id}}"
+        InstanceType: !Ref Gpu2Type
+        IamInstanceProfile: {Arn: !GetAtt GpuProfile.Arn}
+        SecurityGroupIds: [!Ref TaskSg]
+        BlockDeviceMappings: [{DeviceName: /dev/xvda, Ebs: {VolumeSize: 80, VolumeType: gp3}}]
+        MetadataOptions: {HttpTokens: required}
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo ECS_CLUSTER=${Cluster} >> /etc/ecs/ecs.config
+        TagSpecifications: [{ResourceType: instance, Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-${Gpu2Type}"}]}]
+  GpuAsg2:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Condition: HasGpu2
+    UpdatePolicy:
+      AutoScalingReplacingUpdate: {WillReplace: true}
+    Properties:
+      MinSize: "0"
+      MaxSize: "1"
+      DesiredCapacity: !Ref GpuDesired
+      VPCZoneIdentifier: [!Ref SubnetA, !Ref SubnetB]
+      LaunchTemplate: {LaunchTemplateId: !Ref GpuLt2, Version: !GetAtt GpuLt2.LatestVersionNumber}
+  GpuTask2:
+    Type: AWS::ECS::TaskDefinition
+    Condition: HasGpu2
+    Properties:
+      Family: !Sub "${AWS::StackName}-gpu2"
+      RequiresCompatibilities: [EC2]
+      NetworkMode: bridge
+      Cpu: "3072"
+      Memory: "12288"
+      ExecutionRoleArn: !GetAtt ExecRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Sub "${Repo.RepositoryUri}:ecs"
+          ResourceRequirements: [{Type: GPU, Value: !Ref Gpu2Gpus}]
+          Environment: [{Name: NVIDIA_DRIVER_CAPABILITIES, Value: all}]
+          LogConfiguration: {LogDriver: awslogs, Options: {awslogs-group: !Ref Logs, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: gpu2}}
+  GpuLt3:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: HasGpu3
+    Properties:
+      LaunchTemplateData:
+        ImageId: "{{resolve:ssm:/aws/service/ecs/optimized-ami/amazon-linux-2023/gpu/recommended/image_id}}"
+        InstanceType: !Ref Gpu3Type
+        IamInstanceProfile: {Arn: !GetAtt GpuProfile.Arn}
+        SecurityGroupIds: [!Ref TaskSg]
+        BlockDeviceMappings: [{DeviceName: /dev/xvda, Ebs: {VolumeSize: 80, VolumeType: gp3}}]
+        MetadataOptions: {HttpTokens: required}
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo ECS_CLUSTER=${Cluster} >> /etc/ecs/ecs.config
+        TagSpecifications: [{ResourceType: instance, Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-${Gpu3Type}"}]}]
+  GpuAsg3:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Condition: HasGpu3
+    UpdatePolicy:
+      AutoScalingReplacingUpdate: {WillReplace: true}
+    Properties:
+      MinSize: "0"
+      MaxSize: "1"
+      DesiredCapacity: !Ref GpuDesired
+      VPCZoneIdentifier: [!Ref SubnetA, !Ref SubnetB]
+      LaunchTemplate: {LaunchTemplateId: !Ref GpuLt3, Version: !GetAtt GpuLt3.LatestVersionNumber}
+  GpuTask3:
+    Type: AWS::ECS::TaskDefinition
+    Condition: HasGpu3
+    Properties:
+      Family: !Sub "${AWS::StackName}-gpu3"
+      RequiresCompatibilities: [EC2]
+      NetworkMode: bridge
+      Cpu: "3072"
+      Memory: "12288"
+      ExecutionRoleArn: !GetAtt ExecRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Sub "${Repo.RepositoryUri}:ecs"
+          ResourceRequirements: [{Type: GPU, Value: !Ref Gpu3Gpus}]
+          Environment: [{Name: NVIDIA_DRIVER_CAPABILITIES, Value: all}]
+          LogConfiguration: {LogDriver: awslogs, Options: {awslogs-group: !Ref Logs, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: gpu3}}
+  GpuLt4:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: HasGpu4
+    Properties:
+      LaunchTemplateData:
+        ImageId: "{{resolve:ssm:/aws/service/ecs/optimized-ami/amazon-linux-2023/gpu/recommended/image_id}}"
+        InstanceType: !Ref Gpu4Type
+        IamInstanceProfile: {Arn: !GetAtt GpuProfile.Arn}
+        SecurityGroupIds: [!Ref TaskSg]
+        BlockDeviceMappings: [{DeviceName: /dev/xvda, Ebs: {VolumeSize: 80, VolumeType: gp3}}]
+        MetadataOptions: {HttpTokens: required}
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo ECS_CLUSTER=${Cluster} >> /etc/ecs/ecs.config
+        TagSpecifications: [{ResourceType: instance, Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-${Gpu4Type}"}]}]
+  GpuAsg4:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Condition: HasGpu4
+    UpdatePolicy:
+      AutoScalingReplacingUpdate: {WillReplace: true}
+    Properties:
+      MinSize: "0"
+      MaxSize: "1"
+      DesiredCapacity: !Ref GpuDesired
+      VPCZoneIdentifier: [!Ref SubnetA, !Ref SubnetB]
+      LaunchTemplate: {LaunchTemplateId: !Ref GpuLt4, Version: !GetAtt GpuLt4.LatestVersionNumber}
+  GpuTask4:
+    Type: AWS::ECS::TaskDefinition
+    Condition: HasGpu4
+    Properties:
+      Family: !Sub "${AWS::StackName}-gpu4"
+      RequiresCompatibilities: [EC2]
+      NetworkMode: bridge
+      Cpu: "3072"
+      Memory: "12288"
+      ExecutionRoleArn: !GetAtt ExecRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Sub "${Repo.RepositoryUri}:ecs"
+          ResourceRequirements: [{Type: GPU, Value: !Ref Gpu4Gpus}]
+          Environment: [{Name: NVIDIA_DRIVER_CAPABILITIES, Value: all}]
+          LogConfiguration: {LogDriver: awslogs, Options: {awslogs-group: !Ref Logs, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: gpu4}}
+  GpuLt5:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: HasGpu5
+    Properties:
+      LaunchTemplateData:
+        ImageId: "{{resolve:ssm:/aws/service/ecs/optimized-ami/amazon-linux-2023/gpu/recommended/image_id}}"
+        InstanceType: !Ref Gpu5Type
+        IamInstanceProfile: {Arn: !GetAtt GpuProfile.Arn}
+        SecurityGroupIds: [!Ref TaskSg]
+        BlockDeviceMappings: [{DeviceName: /dev/xvda, Ebs: {VolumeSize: 80, VolumeType: gp3}}]
+        MetadataOptions: {HttpTokens: required}
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo ECS_CLUSTER=${Cluster} >> /etc/ecs/ecs.config
+        TagSpecifications: [{ResourceType: instance, Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-${Gpu5Type}"}]}]
+  GpuAsg5:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Condition: HasGpu5
+    UpdatePolicy:
+      AutoScalingReplacingUpdate: {WillReplace: true}
+    Properties:
+      MinSize: "0"
+      MaxSize: "1"
+      DesiredCapacity: !Ref GpuDesired
+      VPCZoneIdentifier: [!Ref SubnetA, !Ref SubnetB]
+      LaunchTemplate: {LaunchTemplateId: !Ref GpuLt5, Version: !GetAtt GpuLt5.LatestVersionNumber}
+  GpuTask5:
+    Type: AWS::ECS::TaskDefinition
+    Condition: HasGpu5
+    Properties:
+      Family: !Sub "${AWS::StackName}-gpu5"
+      RequiresCompatibilities: [EC2]
+      NetworkMode: bridge
+      Cpu: "3072"
+      Memory: "12288"
+      ExecutionRoleArn: !GetAtt ExecRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Sub "${Repo.RepositoryUri}:ecs"
+          ResourceRequirements: [{Type: GPU, Value: !Ref Gpu5Gpus}]
+          Environment: [{Name: NVIDIA_DRIVER_CAPABILITIES, Value: all}]
+          LogConfiguration: {LogDriver: awslogs, Options: {awslogs-group: !Ref Logs, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: gpu5}}
+
+  # ---------- Lambda (container images, 10 GB = ~6 vCPU) ----------
+  FnX86:
+    Type: AWS::Lambda::Function
+    Condition: LambdaOn
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-x86"
+      PackageType: Image
+      Code: {ImageUri: !Sub "${Repo.RepositoryUri}:lambda-x86"}
+      Architectures: [x86_64]
+      MemorySize: 10240
+      EphemeralStorage: {Size: 10240}
+      Timeout: 900
+      Role: !GetAtt TaskRole.Arn
+  FnArm:
+    Type: AWS::Lambda::Function
+    Condition: LambdaOn
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-arm64"
+      PackageType: Image
+      Code: {ImageUri: !Sub "${Repo.RepositoryUri}:lambda-arm64"}
+      Architectures: [arm64]
+      MemorySize: 10240
+      EphemeralStorage: {Size: 10240}
+      Timeout: 900
+      Role: !GetAtt TaskRole.Arn
 
   # ---------- MediaConvert ----------
   McRole:
@@ -185,8 +538,9 @@ Resources:
           PolicyDocument:
             Statement:
               - {Effect: Allow, Action: [mediaconvert:CreateJob, mediaconvert:GetJob, mediaconvert:CancelJob], Resource: "*"}
-              - {Effect: Allow, Action: [ecs:RunTask], Resource: [!Ref BeatTask, !Ref SegTask, !Ref ConcatTask]}
+              - {Effect: Allow, Action: [ecs:RunTask], Resource: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${AWS::StackName}-*"}
               - {Effect: Allow, Action: [ecs:StopTask, ecs:DescribeTasks], Resource: "*"}
+              - {Effect: Allow, Action: [lambda:InvokeFunction], Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-*"}
               - {Effect: Allow, Action: iam:PassRole, Resource: [!GetAtt McRole.Arn, !GetAtt ExecRole.Arn, !GetAtt TaskRole.Arn]}
               - {Effect: Allow, Action: [events:PutTargets, events:PutRule, events:DescribeRule],
                  Resource: [!Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForMediaConvertJobRule",
@@ -198,6 +552,7 @@ Resources:
       RoleArn: !GetAtt SfnRole.Arn
       DefinitionSubstitutions:
         McRole: !GetAtt McRole.Arn
+        McAccel: !Ref McAcceleration
         Cluster: !GetAtt Cluster.Arn
         BeatTask: !Ref BeatTask
         SegTask: !Ref SegTask
@@ -206,145 +561,13 @@ Resources:
         SubnetB: !Ref SubnetB
         Sg: !Ref TaskSg
         SegCount: !Ref SegmentCount
-        McAccel: !Ref McAcceleration
+        LambdaSegCount: !Ref LambdaSegments
+        FnX86: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-x86"
+        FnArm: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-arm64"
       DefinitionString: |
-        {
-          "Comment": "transcode + beats",
-          "StartAt": "Fanout",
-          "States": {
-            "Fanout": {
-              "Type": "Parallel",
-              "End": true,
-              "Branches": [
-                {
-                  "StartAt": "MediaConvert",
-                  "States": {
-                    "MediaConvert": {
-                      "Type": "Task",
-                      "Resource": "arn:aws:states:::mediaconvert:createJob.sync",
-                      "Parameters": {
-                        "Role": "${McRole}",
-                        "AccelerationSettings": {"Mode": "${McAccel}"},
-                        "Settings": {
-                          "TimecodeConfig": {"Source": "ZEROBASED"},
-                          "Inputs": [{
-                            "FileInput.$": "States.Format('s3://{}/{}', $.bucket, $.key)",
-                            "AudioSelectors": {"Audio Selector 1": {"DefaultSelection": "DEFAULT"}},
-                            "VideoSelector": {},
-                            "TimecodeSource": "ZEROBASED"
-                          }],
-                          "OutputGroups": [{
-                            "Name": "File Group",
-                            "OutputGroupSettings": {
-                              "Type": "FILE_GROUP_SETTINGS",
-                              "FileGroupSettings": {"Destination.$": "States.Format('s3://{}/output/{}/mediaconvert/720p', $.bucket, $.id)"}
-                            },
-                            "Outputs": [{
-                              "ContainerSettings": {"Container": "MP4", "Mp4Settings": {"MoovPlacement": "PROGRESSIVE_DOWNLOAD"}},
-                              "VideoDescription": {
-                                "Width": 1280, "Height": 720,
-                                "CodecSettings": {"Codec": "H_264", "H264Settings": {
-                                  "RateControlMode": "QVBR", "QvbrSettings": {"QvbrQualityLevel": 7},
-                                  "MaxBitrate": 5000000, "FramerateControl": "INITIALIZE_FROM_SOURCE",
-                                  "SceneChangeDetect": "TRANSITION_DETECTION"}}
-                              },
-                              "AudioDescriptions": [{"CodecSettings": {"Codec": "AAC", "AacSettings": {
-                                "Bitrate": 128000, "CodingMode": "CODING_MODE_2_0", "SampleRate": 48000}}}]
-                            }]
-                          }]
-                        }
-                      },
-                      "ResultSelector": {"jobId.$": "$.Job.Id", "timing.$": "$.Job.Timing", "outputs.$": "$.Job.OutputGroupDetails", "accel.$": "$.Job.AccelerationSettings.Mode", "accelStatus.$": "$.Job.AccelerationStatus"},
-                      "End": true
-                    }
-                  }
-                },
-                {
-                  "StartAt": "Beat",
-                  "States": {
-                    "Beat": {
-                      "Type": "Task",
-                      "Resource": "arn:aws:states:::ecs:runTask.sync",
-                      "Parameters": {
-                        "Cluster": "${Cluster}", "TaskDefinition": "${BeatTask}", "LaunchType": "FARGATE",
-                        "NetworkConfiguration": {"AwsvpcConfiguration": {"Subnets": ["${SubnetA}", "${SubnetB}"], "SecurityGroups": ["${Sg}"], "AssignPublicIp": "ENABLED"}},
-                        "Overrides": {"ContainerOverrides": [{"Name": "worker", "Environment": [
-                          {"Name": "MODE", "Value": "beat"},
-                          {"Name": "BUCKET", "Value.$": "$.bucket"},
-                          {"Name": "KEY", "Value.$": "$.key"},
-                          {"Name": "JOB_ID", "Value.$": "$.id"}]}]}
-                      },
-                      "ResultSelector": {"createdAt.$": "$.CreatedAt", "startedAt.$": "$.StartedAt", "stoppedAt.$": "$.StoppedAt", "cpu.$": "$.Cpu", "memory.$": "$.Memory"},
-                      "Retry": [{"ErrorEquals": ["ECS.AmazonECSException"], "IntervalSeconds": 10, "MaxAttempts": 5, "BackoffRate": 2}],
-                      "End": true
-                    }
-                  }
-                },
-                {
-                  "StartAt": "Slices",
-                  "States": {
-                    "Slices": {
-                      "Type": "Pass",
-                      "Parameters": {"bucket.$": "$.bucket", "key.$": "$.key", "id.$": "$.id", "segs.$": "States.ArrayRange(1, ${SegCount}, 1)"},
-                      "Next": "FfmpegSegments"
-                    },
-                    "FfmpegSegments": {
-                      "Type": "Map",
-                      "ItemsPath": "$.segs",
-                      "MaxConcurrency": 0,
-                      "ItemSelector": {"bucket.$": "$.bucket", "key.$": "$.key", "id.$": "$.id", "i.$": "States.Format('{}', $$.Map.Item.Value)"},
-                      "ItemProcessor": {
-                        "ProcessorConfig": {"Mode": "INLINE"},
-                        "StartAt": "Segment",
-                        "States": {
-                          "Segment": {
-                            "Type": "Task",
-                            "Resource": "arn:aws:states:::ecs:runTask.sync",
-                            "Parameters": {
-                              "Cluster": "${Cluster}", "TaskDefinition": "${SegTask}", "LaunchType": "FARGATE",
-                              "NetworkConfiguration": {"AwsvpcConfiguration": {"Subnets": ["${SubnetA}", "${SubnetB}"], "SecurityGroups": ["${Sg}"], "AssignPublicIp": "ENABLED"}},
-                              "Overrides": {"ContainerOverrides": [{"Name": "worker", "Environment": [
-                                {"Name": "MODE", "Value": "segment"},
-                                {"Name": "BUCKET", "Value.$": "$.bucket"},
-                                {"Name": "KEY", "Value.$": "$.key"},
-                                {"Name": "JOB_ID", "Value.$": "$.id"},
-                                {"Name": "SEG_INDEX", "Value.$": "$.i"},
-                                {"Name": "SEG_COUNT", "Value": "${SegCount}"}]}]}
-                            },
-                            "ResultSelector": {"createdAt.$": "$.CreatedAt", "startedAt.$": "$.StartedAt", "stoppedAt.$": "$.StoppedAt", "cpu.$": "$.Cpu", "memory.$": "$.Memory"},
-                            "Retry": [{"ErrorEquals": ["ECS.AmazonECSException"], "IntervalSeconds": 10, "MaxAttempts": 5, "BackoffRate": 2}],
-                            "End": true
-                          }
-                        }
-                      },
-                      "ResultPath": "$.segments",
-                      "Next": "Concat"
-                    },
-                    "Concat": {
-                      "Type": "Task",
-                      "Resource": "arn:aws:states:::ecs:runTask.sync",
-                      "Parameters": {
-                        "Cluster": "${Cluster}", "TaskDefinition": "${ConcatTask}", "LaunchType": "FARGATE",
-                        "NetworkConfiguration": {"AwsvpcConfiguration": {"Subnets": ["${SubnetA}", "${SubnetB}"], "SecurityGroups": ["${Sg}"], "AssignPublicIp": "ENABLED"}},
-                        "Overrides": {"ContainerOverrides": [{"Name": "worker", "Environment": [
-                          {"Name": "MODE", "Value": "concat"},
-                          {"Name": "BUCKET", "Value.$": "$.bucket"},
-                          {"Name": "KEY", "Value.$": "$.key"},
-                          {"Name": "JOB_ID", "Value.$": "$.id"}]}]}
-                      },
-                      "ResultSelector": {"createdAt.$": "$.CreatedAt", "startedAt.$": "$.StartedAt", "stoppedAt.$": "$.StoppedAt", "cpu.$": "$.Cpu", "memory.$": "$.Memory"},
-                      "ResultPath": "$.concat",
-                      "Retry": [{"ErrorEquals": ["ECS.AmazonECSException"], "IntervalSeconds": 10, "MaxAttempts": 5, "BackoffRate": 2}],
-                      "End": true
-                    }
-                  }
-                }
-              ]
-            }
-          }
-        }
+        {"Comment":"transcode + beats, every compute option side by side","StartAt":"Fanout","States":{"Fanout":{"Type":"Parallel","End":true,"Branches":[{"StartAt":"RunMc?","States":{"RunMc?":{"Type":"Choice","Choices":[{"Variable":"$.routes.mc","BooleanEquals":true,"Next":"MediaConvert"}],"Default":"SkipMc"},"SkipMc":{"Type":"Pass","Result":{"skipped":true},"End":true},"MediaConvert":{"Type":"Task","Resource":"arn:aws:states:::mediaconvert:createJob.sync","Parameters":{"Role":"${McRole}","AccelerationSettings":{"Mode":"${McAccel}"},"Settings":{"TimecodeConfig":{"Source":"ZEROBASED"},"Inputs":[{"FileInput.$":"States.Format('s3://{}/{}', $.bucket, $.key)","AudioSelectors":{"Audio Selector 1":{"DefaultSelection":"DEFAULT"}},"VideoSelector":{},"TimecodeSource":"ZEROBASED"}],"OutputGroups":[{"Name":"File Group","OutputGroupSettings":{"Type":"FILE_GROUP_SETTINGS","FileGroupSettings":{"Destination.$":"States.Format('s3://{}/output/{}/mediaconvert/720p', $.bucket, $.id)"}},"Outputs":[{"ContainerSettings":{"Container":"MP4","Mp4Settings":{"MoovPlacement":"PROGRESSIVE_DOWNLOAD"}},"VideoDescription":{"Width":1280,"Height":720,"VideoPreprocessors":{"ColorCorrector":{"ColorSpaceConversion":"FORCE_709","HdrToSdrToneMapper":"PRESERVE_DETAILS"}},"CodecSettings":{"Codec":"H_264","H264Settings":{"RateControlMode":"QVBR","QvbrSettings":{"QvbrQualityLevel":7},"MaxBitrate":5000000,"FramerateControl":"INITIALIZE_FROM_SOURCE","SceneChangeDetect":"TRANSITION_DETECTION"}}},"AudioDescriptions":[{"CodecSettings":{"Codec":"AAC","AacSettings":{"Bitrate":128000,"CodingMode":"CODING_MODE_2_0","SampleRate":48000}}}]}]}]}},"ResultSelector":{"jobId.$":"$.Job.Id","timing.$":"$.Job.Timing","outputs.$":"$.Job.OutputGroupDetails","accelStatus.$":"$.Job.AccelerationStatus"},"End":true,"Catch":[{"ErrorEquals":["States.ALL"],"ResultPath":"$.error","Next":"FailedMc"}]},"FailedMc":{"Type":"Pass","Parameters":{"failed.$":"$.error"},"End":true}}},{"StartAt":"RunFargate?","States":{"RunFargate?":{"Type":"Choice","Choices":[{"Variable":"$.routes.fargate","BooleanEquals":true,"Next":"Fargate"}],"Default":"SkipFargate"},"SkipFargate":{"Type":"Pass","Result":{"skipped":true},"End":true},"Fargate":{"Type":"Parallel","End":true,"Branches":[{"StartAt":"FgBeat","States":{"FgBeat":{"Type":"Task","Resource":"arn:aws:states:::ecs:runTask.sync","Parameters":{"Cluster":"${Cluster}","TaskDefinition":"${BeatTask}","LaunchType":"FARGATE","NetworkConfiguration":{"AwsvpcConfiguration":{"Subnets":["${SubnetA}","${SubnetB}"],"SecurityGroups":["${Sg}"],"AssignPublicIp":"ENABLED"}},"Overrides":{"ContainerOverrides":[{"Name":"worker","Environment":[{"Name":"MODE","Value":"beat"},{"Name":"ROUTE","Value":"fargate"},{"Name":"BUCKET","Value.$":"$.bucket"},{"Name":"KEY","Value.$":"$.key"},{"Name":"JOB_ID","Value.$":"$.id"}]}]}},"ResultSelector":{"createdAt.$":"$.CreatedAt","startedAt.$":"$.StartedAt","stoppedAt.$":"$.StoppedAt","cpu.$":"$.Cpu","memory.$":"$.Memory"},"Retry":[{"ErrorEquals":["ECS.AmazonECSException"],"IntervalSeconds":10,"MaxAttempts":5,"BackoffRate":2}],"End":true}}},{"StartAt":"FgSlices","States":{"FgSlices":{"Type":"Pass","Parameters":{"bucket.$":"$.bucket","key.$":"$.key","id.$":"$.id","segs.$":"States.ArrayRange(1, ${SegCount}, 1)"},"Next":"FgSegments"},"FgSegments":{"Type":"Map","ItemsPath":"$.segs","MaxConcurrency":0,"ItemSelector":{"bucket.$":"$.bucket","key.$":"$.key","id.$":"$.id","i.$":"States.Format('{}', $$.Map.Item.Value)"},"ItemProcessor":{"ProcessorConfig":{"Mode":"INLINE"},"StartAt":"FgSegment","States":{"FgSegment":{"Type":"Task","Resource":"arn:aws:states:::ecs:runTask.sync","Parameters":{"Cluster":"${Cluster}","TaskDefinition":"${SegTask}","LaunchType":"FARGATE","NetworkConfiguration":{"AwsvpcConfiguration":{"Subnets":["${SubnetA}","${SubnetB}"],"SecurityGroups":["${Sg}"],"AssignPublicIp":"ENABLED"}},"Overrides":{"ContainerOverrides":[{"Name":"worker","Environment":[{"Name":"MODE","Value":"segment"},{"Name":"ROUTE","Value":"fargate"},{"Name":"BUCKET","Value.$":"$.bucket"},{"Name":"KEY","Value.$":"$.key"},{"Name":"JOB_ID","Value.$":"$.id"},{"Name":"SEG_INDEX","Value.$":"$.i"},{"Name":"SEG_COUNT","Value":"${SegCount}"}]}]}},"ResultSelector":{"createdAt.$":"$.CreatedAt","startedAt.$":"$.StartedAt","stoppedAt.$":"$.StoppedAt","cpu.$":"$.Cpu","memory.$":"$.Memory"},"Retry":[{"ErrorEquals":["ECS.AmazonECSException"],"IntervalSeconds":10,"MaxAttempts":5,"BackoffRate":2}],"End":true}}},"ResultPath":"$.segments","Next":"FgConcat"},"FgConcat":{"Type":"Task","Resource":"arn:aws:states:::ecs:runTask.sync","Parameters":{"Cluster":"${Cluster}","TaskDefinition":"${ConcatTask}","LaunchType":"FARGATE","NetworkConfiguration":{"AwsvpcConfiguration":{"Subnets":["${SubnetA}","${SubnetB}"],"SecurityGroups":["${Sg}"],"AssignPublicIp":"ENABLED"}},"Overrides":{"ContainerOverrides":[{"Name":"worker","Environment":[{"Name":"MODE","Value":"concat"},{"Name":"ROUTE","Value":"fargate"},{"Name":"BUCKET","Value.$":"$.bucket"},{"Name":"KEY","Value.$":"$.key"},{"Name":"JOB_ID","Value.$":"$.id"}]}]}},"ResultSelector":{"createdAt.$":"$.CreatedAt","startedAt.$":"$.StartedAt","stoppedAt.$":"$.StoppedAt","cpu.$":"$.Cpu","memory.$":"$.Memory"},"Retry":[{"ErrorEquals":["ECS.AmazonECSException"],"IntervalSeconds":10,"MaxAttempts":5,"BackoffRate":2}],"ResultPath":"$.concat","End":true}}}],"Catch":[{"ErrorEquals":["States.ALL"],"ResultPath":"$.error","Next":"FailedFargate"}]},"FailedFargate":{"Type":"Pass","Parameters":{"failed.$":"$.error"},"End":true}}},{"StartAt":"RunLambdaX86?","States":{"RunLambdaX86?":{"Type":"Choice","Choices":[{"Variable":"$.routes.lambdaX86","BooleanEquals":true,"Next":"LambdaX86"}],"Default":"SkipLambdaX86"},"SkipLambdaX86":{"Type":"Pass","Result":{"skipped":true},"End":true},"LambdaX86":{"Type":"Parallel","End":true,"Branches":[{"StartAt":"LxBeat","States":{"LxBeat":{"Type":"Task","Resource":"arn:aws:states:::lambda:invoke","Parameters":{"FunctionName":"${FnX86}","Payload":{"MODE":"beat","ROUTE":"lambda-x86","BUCKET.$":"$.bucket","KEY.$":"$.key","JOB_ID.$":"$.id","ENTERED.$":"$$.State.EnteredTime"}},"ResultSelector":{"t.$":"$.Payload"},"Retry":[{"ErrorEquals":["Lambda.TooManyRequestsException","Lambda.ServiceException","Lambda.SdkClientException"],"IntervalSeconds":5,"MaxAttempts":5,"BackoffRate":2}],"End":true}}},{"StartAt":"LxSlices","States":{"LxSlices":{"Type":"Pass","Parameters":{"bucket.$":"$.bucket","key.$":"$.key","id.$":"$.id","segs.$":"States.ArrayRange(1, ${LambdaSegCount}, 1)"},"Next":"LxSegments"},"LxSegments":{"Type":"Map","ItemsPath":"$.segs","MaxConcurrency":0,"ItemSelector":{"bucket.$":"$.bucket","key.$":"$.key","id.$":"$.id","i.$":"States.Format('{}', $$.Map.Item.Value)"},"ItemProcessor":{"ProcessorConfig":{"Mode":"INLINE"},"StartAt":"LxSegment","States":{"LxSegment":{"Type":"Task","Resource":"arn:aws:states:::lambda:invoke","Parameters":{"FunctionName":"${FnX86}","Payload":{"MODE":"segment","ROUTE":"lambda-x86","BUCKET.$":"$.bucket","KEY.$":"$.key","JOB_ID.$":"$.id","ENTERED.$":"$$.State.EnteredTime","SEG_INDEX.$":"$.i","SEG_COUNT":"${LambdaSegCount}"}},"ResultSelector":{"t.$":"$.Payload"},"Retry":[{"ErrorEquals":["Lambda.TooManyRequestsException","Lambda.ServiceException","Lambda.SdkClientException"],"IntervalSeconds":5,"MaxAttempts":5,"BackoffRate":2}],"End":true}}},"ResultPath":"$.segments","Next":"LxConcat"},"LxConcat":{"Type":"Task","Resource":"arn:aws:states:::lambda:invoke","Parameters":{"FunctionName":"${FnX86}","Payload":{"MODE":"concat","ROUTE":"lambda-x86","BUCKET.$":"$.bucket","KEY.$":"$.key","JOB_ID.$":"$.id","ENTERED.$":"$$.State.EnteredTime"}},"ResultSelector":{"t.$":"$.Payload"},"Retry":[{"ErrorEquals":["Lambda.TooManyRequestsException","Lambda.ServiceException","Lambda.SdkClientException"],"IntervalSeconds":5,"MaxAttempts":5,"BackoffRate":2}],"ResultPath":"$.concat","End":true}}}],"Catch":[{"ErrorEquals":["States.ALL"],"ResultPath":"$.error","Next":"FailedLambdaX86"}]},"FailedLambdaX86":{"Type":"Pass","Parameters":{"failed.$":"$.error"},"End":true}}},{"StartAt":"RunLambdaArm?","States":{"RunLambdaArm?":{"Type":"Choice","Choices":[{"Variable":"$.routes.lambdaArm","BooleanEquals":true,"Next":"LambdaArm"}],"Default":"SkipLambdaArm"},"SkipLambdaArm":{"Type":"Pass","Result":{"skipped":true},"End":true},"LambdaArm":{"Type":"Parallel","End":true,"Branches":[{"StartAt":"LaBeat","States":{"LaBeat":{"Type":"Task","Resource":"arn:aws:states:::lambda:invoke","Parameters":{"FunctionName":"${FnArm}","Payload":{"MODE":"beat","ROUTE":"lambda-arm64","BUCKET.$":"$.bucket","KEY.$":"$.key","JOB_ID.$":"$.id","ENTERED.$":"$$.State.EnteredTime"}},"ResultSelector":{"t.$":"$.Payload"},"Retry":[{"ErrorEquals":["Lambda.TooManyRequestsException","Lambda.ServiceException","Lambda.SdkClientException"],"IntervalSeconds":5,"MaxAttempts":5,"BackoffRate":2}],"End":true}}},{"StartAt":"LaSlices","States":{"LaSlices":{"Type":"Pass","Parameters":{"bucket.$":"$.bucket","key.$":"$.key","id.$":"$.id","segs.$":"States.ArrayRange(1, ${LambdaSegCount}, 1)"},"Next":"LaSegments"},"LaSegments":{"Type":"Map","ItemsPath":"$.segs","MaxConcurrency":0,"ItemSelector":{"bucket.$":"$.bucket","key.$":"$.key","id.$":"$.id","i.$":"States.Format('{}', $$.Map.Item.Value)"},"ItemProcessor":{"ProcessorConfig":{"Mode":"INLINE"},"StartAt":"LaSegment","States":{"LaSegment":{"Type":"Task","Resource":"arn:aws:states:::lambda:invoke","Parameters":{"FunctionName":"${FnArm}","Payload":{"MODE":"segment","ROUTE":"lambda-arm64","BUCKET.$":"$.bucket","KEY.$":"$.key","JOB_ID.$":"$.id","ENTERED.$":"$$.State.EnteredTime","SEG_INDEX.$":"$.i","SEG_COUNT":"${LambdaSegCount}"}},"ResultSelector":{"t.$":"$.Payload"},"Retry":[{"ErrorEquals":["Lambda.TooManyRequestsException","Lambda.ServiceException","Lambda.SdkClientException"],"IntervalSeconds":5,"MaxAttempts":5,"BackoffRate":2}],"End":true}}},"ResultPath":"$.segments","Next":"LaConcat"},"LaConcat":{"Type":"Task","Resource":"arn:aws:states:::lambda:invoke","Parameters":{"FunctionName":"${FnArm}","Payload":{"MODE":"concat","ROUTE":"lambda-arm64","BUCKET.$":"$.bucket","KEY.$":"$.key","JOB_ID.$":"$.id","ENTERED.$":"$$.State.EnteredTime"}},"ResultSelector":{"t.$":"$.Payload"},"Retry":[{"ErrorEquals":["Lambda.TooManyRequestsException","Lambda.ServiceException","Lambda.SdkClientException"],"IntervalSeconds":5,"MaxAttempts":5,"BackoffRate":2}],"ResultPath":"$.concat","End":true}}}],"Catch":[{"ErrorEquals":["States.ALL"],"ResultPath":"$.error","Next":"FailedLambdaArm"}]},"FailedLambdaArm":{"Type":"Pass","Parameters":{"failed.$":"$.error"},"End":true}}},{"StartAt":"RunGpu?","States":{"RunGpu?":{"Type":"Choice","Choices":[{"Variable":"$.routes.gpu","BooleanEquals":true,"Next":"GpuMap"}],"Default":"SkipGpu"},"SkipGpu":{"Type":"Pass","Result":{"skipped":true},"End":true},"GpuMap":{"Type":"Map","ItemsPath":"$.gpus","MaxConcurrency":0,"ItemSelector":{"bucket.$":"$.bucket","key.$":"$.key","id.$":"$.id","type.$":"$$.Map.Item.Value.type","taskdef.$":"$$.Map.Item.Value.taskdef","streams.$":"$$.Map.Item.Value.streams"},"ItemProcessor":{"ProcessorConfig":{"Mode":"INLINE"},"StartAt":"Gpu","States":{"Gpu":{"Type":"Task","Resource":"arn:aws:states:::ecs:runTask.sync","Parameters":{"Cluster":"${Cluster}","TaskDefinition.$":"$.taskdef","LaunchType":"EC2","PlacementConstraints":[{"Type":"memberOf","Expression.$":"States.Format('attribute:ecs.instance-type == {}', $.type)"}],"Overrides":{"ContainerOverrides":[{"Name":"worker","Environment":[{"Name":"MODE","Value":"gpu"},{"Name":"ROUTE","Value.$":"States.Format('gpu-{}', $.type)"},{"Name":"BUCKET","Value.$":"$.bucket"},{"Name":"KEY","Value.$":"$.key"},{"Name":"JOB_ID","Value.$":"$.id"},{"Name":"GPU_STREAMS","Value.$":"$.streams"},{"Name":"INSTANCE_TYPE","Value.$":"$.type"}]}]}},"ResultSelector":{"createdAt.$":"$.CreatedAt","startedAt.$":"$.StartedAt","stoppedAt.$":"$.StoppedAt","cpu.$":"$.Cpu","memory.$":"$.Memory"},"Retry":[{"ErrorEquals":["ECS.AmazonECSException"],"IntervalSeconds":10,"MaxAttempts":5,"BackoffRate":2},{"ErrorEquals":["States.TaskFailed"],"IntervalSeconds":30,"MaxAttempts":2}],"End":true}}},"End":true,"Catch":[{"ErrorEquals":["States.ALL"],"ResultPath":"$.error","Next":"FailedGpu"}]},"FailedGpu":{"Type":"Pass","Parameters":{"failed.$":"$.error"},"End":true}}}]}}}
 
-  # ---------- trigger: any object under input/ starts one execution ----------
+  # ---------- production trigger: object under input/ -> MediaConvert + Fargate routes ----------
   TriggerRole:
     Type: AWS::IAM::Role
     Properties:
@@ -367,9 +590,27 @@ Resources:
           RoleArn: !GetAtt TriggerRole.Arn
           InputTransformer:
             InputPathsMap: {b: $.detail.bucket.name, k: $.detail.object.key, id: $.id}
-            InputTemplate: '{"bucket": "<b>", "key": "<k>", "id": "<id>"}'
+            InputTemplate: '{"bucket": "<b>", "key": "<k>", "id": "<id>", "routes": {"mc": false, "fargate": true, "lambdaX86": false, "lambdaArm": false, "gpu": false}, "gpus": []}'
 
 Outputs:
   BucketName: {Value: !Ref Bucket}
-  BuildProject: {Value: !Ref Build}
+  BuildX86: {Value: !Ref BuildX86}
+  BuildArm: {Value: !Ref BuildArm}
+  RepoUri: {Value: !GetAtt Repo.RepositoryUri}
   StateMachineArn: {Value: !Ref Pipeline}
+  Cluster: {Value: !Ref Cluster}
+  GpuTask1:
+    Condition: HasGpu1
+    Value: !Sub "${Gpu1Type}|${GpuTask1}|${Gpu1Streams}"
+  GpuTask2:
+    Condition: HasGpu2
+    Value: !Sub "${Gpu2Type}|${GpuTask2}|${Gpu2Streams}"
+  GpuTask3:
+    Condition: HasGpu3
+    Value: !Sub "${Gpu3Type}|${GpuTask3}|${Gpu3Streams}"
+  GpuTask4:
+    Condition: HasGpu4
+    Value: !Sub "${Gpu4Type}|${GpuTask4}|${Gpu4Streams}"
+  GpuTask5:
+    Condition: HasGpu5
+    Value: !Sub "${Gpu5Type}|${GpuTask5}|${Gpu5Streams}"

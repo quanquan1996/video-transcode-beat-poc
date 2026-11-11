@@ -1,0 +1,11 @@
+# Lambda container image (x86_64 or arm64, same file). bin/ and model/ are prepared by buildspec.yml.
+FROM public.ecr.aws/lambda/python:3.12
+COPY bin/ffmpeg bin/ffprobe /usr/local/bin/
+RUN dnf install -y libgomp && dnf clean all
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir --target "${LAMBDA_TASK_ROOT}" torch==2.5.1 torchaudio==2.5.1 --index-url ${TORCH_INDEX} \
+ && pip install --no-cache-dir --target "${LAMBDA_TASK_ROOT}" beat-this numpy einops soxr rotary-embedding-torch tqdm
+COPY model/final0.ckpt /opt/model/final0.ckpt
+COPY worker.py ${LAMBDA_TASK_ROOT}/
+ENV CKPT=/opt/model/final0.ckpt
+CMD ["worker.handler"]

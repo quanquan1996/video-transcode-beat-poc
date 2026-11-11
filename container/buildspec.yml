@@ -1,11 +1,27 @@
 version: 0.2
+# Env from CodeBuild project: REPO_URI, ARCH (x86 | arm64)
+env:
+  variables:
+    FF_RELEASE: https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/autobuild-2026-11-10-12-39
+    FF_VERSION: ffmpeg-n8.1.3-34-ga35157abb9
+    CKPT_URL: https://huggingface.co/Audante/beat-this-final0/resolve/main/beat_this-final0.ckpt
+    CKPT_SHA256: 8c328b45f59d8dd3dff219253ff6a8d6482be57d0133a29140e2febbf8eb8331
 phases:
-  pre_build:
-    commands:
-      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REPO_URI
   build:
     commands:
-      - cd container && docker build -t $REPO_URI:latest .
-  post_build:
-    commands:
-      - docker push $REPO_URI:latest
+      - |
+        set -e
+        aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin ${REPO_URI%%/*}
+        cd container
+        if [ "$ARCH" = arm64 ]; then FA=linuxarm64; TI=https://pypi.org/simple; else FA=linux64; TI=https://download.pytorch.org/whl/cpu; fi
+        curl -fsSL -o /tmp/ff.tar.xz "$FF_RELEASE/$FF_VERSION-$FA-gpl-8.1.tar.xz"
+        mkdir -p bin model
+        tar -xJf /tmp/ff.tar.xz --strip-components=2 -C bin --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'
+        curl -fsSL -o model/final0.ckpt "$CKPT_URL"
+        echo "$CKPT_SHA256  model/final0.ckpt" | sha256sum -c -
+        if [ "$ARCH" = x86 ]; then
+          docker build --provenance=false -t $REPO_URI:ecs -f Dockerfile .
+          docker push $REPO_URI:ecs
+        fi
+        docker build --provenance=false --build-arg TORCH_INDEX=$TI -t $REPO_URI:lambda-$ARCH -f Dockerfile.lambda .
+        docker push $REPO_URI:lambda-$ARCH
