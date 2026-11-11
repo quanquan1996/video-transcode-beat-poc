@@ -1,0 +1,367 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Video transcode + beat-tracking POC. S3 upload -> EventBridge -> Step Functions, three parallel branches:
+  (A) MediaConvert 720p, (B) beat_this on Fargate, (C) segmented ffmpeg on Fargate + concat (comparison).
+
+Parameters:
+  SegmentCount:
+    Type: Number
+    Default: 8
+    Description: Number of parallel ffmpeg slices for branch C.
+  SegmentCpu:
+    Type: String
+    Default: "8192"
+    AllowedValues: ["2048", "4096", "8192", "16384"]
+  BeatCpu:
+    Type: String
+    Default: "4096"
+    AllowedValues: ["1024", "2048", "4096", "8192"]
+
+Mappings:
+  Mem:  # Fargate memory per CPU size (2 GB / vCPU)
+    "1024": {MB: "2048"}
+    "2048": {MB: "4096"}
+    "4096": {MB: "8192"}
+    "8192": {MB: "16384"}
+    "16384": {MB: "32768"}
+
+Resources:
+  # ---------- network: small VPC with public subnets (tasks only need egress to S3/ECR) ----------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties: {CidrBlock: 10.42.0.0/16, EnableDnsHostnames: true, EnableDnsSupport: true,
+                 Tags: [{Key: Name, Value: !Ref AWS::StackName}]}
+  Igw: {Type: AWS::EC2::InternetGateway}
+  IgwAttach: {Type: AWS::EC2::VPCGatewayAttachment, Properties: {VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw}}
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref Vpc, CidrBlock: 10.42.0.0/20, MapPublicIpOnLaunch: true,
+                 AvailabilityZone: !Select [0, !GetAZs ""]}
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref Vpc, CidrBlock: 10.42.16.0/20, MapPublicIpOnLaunch: true,
+                 AvailabilityZone: !Select [1, !GetAZs ""]}
+  Rt: {Type: AWS::EC2::RouteTable, Properties: {VpcId: !Ref Vpc}}
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties: {RouteTableId: !Ref Rt, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref Igw}
+  RtA: {Type: AWS::EC2::SubnetRouteTableAssociation, Properties: {SubnetId: !Ref SubnetA, RouteTableId: !Ref Rt}}
+  RtB: {Type: AWS::EC2::SubnetRouteTableAssociation, Properties: {SubnetId: !Ref SubnetB, RouteTableId: !Ref Rt}}
+  S3Endpoint:  # S3 traffic stays on the AWS network and costs nothing
+    Type: AWS::EC2::VPCEndpoint
+    Properties: {VpcId: !Ref Vpc, ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3", RouteTableIds: [!Ref Rt]}
+  TaskSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties: {GroupDescription: egress only, VpcId: !Ref Vpc}
+
+  # ---------- storage ----------
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-${AWS::AccountId}-${AWS::Region}"
+      NotificationConfiguration: {EventBridgeConfiguration: {EventBridgeEnabled: true}}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      LifecycleConfiguration: {Rules: [{Id: expire, Status: Enabled, ExpirationInDays: 14}]}
+  Repo:
+    Type: AWS::ECR::Repository
+    Properties: {RepositoryName: !Sub "${AWS::StackName}-worker", EmptyOnDelete: true}
+
+  # ---------- image build (CloudShell has no Docker, so CodeBuild builds the image) ----------
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Statement: [{Effect: Allow, Principal: {Service: codebuild.amazonaws.com}, Action: sts:AssumeRole}]}
+      Policies:
+        - PolicyName: build
+          PolicyDocument:
+            Statement:
+              - {Effect: Allow, Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents], Resource: "*"}
+              - {Effect: Allow, Action: [ecr:GetAuthorizationToken], Resource: "*"}
+              - {Effect: Allow, Action: [ecr:BatchCheckLayerAvailability, ecr:InitiateLayerUpload, ecr:UploadLayerPart,
+                                          ecr:CompleteLayerUpload, ecr:PutImage, ecr:BatchGetImage], Resource: !GetAtt Repo.Arn}
+              - {Effect: Allow, Action: [s3:GetObject, s3:GetObjectVersion], Resource: !Sub "${Bucket.Arn}/build/*"}
+  Build:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-build"
+      ServiceRole: !GetAtt BuildRole.Arn
+      Source: {Type: S3, Location: !Sub "${Bucket}/build/src.zip", BuildSpec: container/buildspec.yml}
+      Artifacts: {Type: NO_ARTIFACTS}
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables: [{Name: REPO_URI, Value: !GetAtt Repo.RepositoryUri}]
+
+  # ---------- ECS / Fargate ----------
+  Cluster: {Type: AWS::ECS::Cluster, Properties: {ClusterName: !Ref AWS::StackName}}
+  Logs: {Type: AWS::Logs::LogGroup, Properties: {LogGroupName: !Sub "/poc/${AWS::StackName}", RetentionInDays: 14}}
+  ExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy]
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: sts:AssumeRole}]}
+      Policies:
+        - PolicyName: s3
+          PolicyDocument:
+            Statement:
+              - {Effect: Allow, Action: [s3:GetObject, s3:PutObject], Resource: !Sub "${Bucket.Arn}/*"}
+              - {Effect: Allow, Action: [s3:ListBucket], Resource: !GetAtt Bucket.Arn}
+  BeatTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-beat"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref BeatCpu
+      Memory: !FindInMap [Mem, !Ref BeatCpu, MB]
+      ExecutionRoleArn: !GetAtt ExecRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform: {CpuArchitecture: X86_64, OperatingSystemFamily: LINUX}
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Sub "${Repo.RepositoryUri}:latest"
+          LogConfiguration: {LogDriver: awslogs, Options: {awslogs-group: !Ref Logs, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: beat}}
+  SegTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-segment"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref SegmentCpu
+      Memory: !FindInMap [Mem, !Ref SegmentCpu, MB]
+      ExecutionRoleArn: !GetAtt ExecRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform: {CpuArchitecture: X86_64, OperatingSystemFamily: LINUX}
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Sub "${Repo.RepositoryUri}:latest"
+          LogConfiguration: {LogDriver: awslogs, Options: {awslogs-group: !Ref Logs, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: seg}}
+  ConcatTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-concat"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "1024"
+      Memory: "2048"
+      ExecutionRoleArn: !GetAtt ExecRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform: {CpuArchitecture: X86_64, OperatingSystemFamily: LINUX}
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Sub "${Repo.RepositoryUri}:latest"
+          LogConfiguration: {LogDriver: awslogs, Options: {awslogs-group: !Ref Logs, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: concat}}
+
+  # ---------- MediaConvert ----------
+  McRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Statement: [{Effect: Allow, Principal: {Service: mediaconvert.amazonaws.com}, Action: sts:AssumeRole}]}
+      Policies:
+        - PolicyName: s3
+          PolicyDocument:
+            Statement:
+              - {Effect: Allow, Action: [s3:GetObject, s3:PutObject], Resource: !Sub "${Bucket.Arn}/*"}
+
+  # ---------- orchestration ----------
+  SfnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Statement: [{Effect: Allow, Principal: {Service: states.amazonaws.com}, Action: sts:AssumeRole}]}
+      Policies:
+        - PolicyName: run
+          PolicyDocument:
+            Statement:
+              - {Effect: Allow, Action: [mediaconvert:CreateJob, mediaconvert:GetJob, mediaconvert:CancelJob], Resource: "*"}
+              - {Effect: Allow, Action: [ecs:RunTask], Resource: [!Ref BeatTask, !Ref SegTask, !Ref ConcatTask]}
+              - {Effect: Allow, Action: [ecs:StopTask, ecs:DescribeTasks], Resource: "*"}
+              - {Effect: Allow, Action: iam:PassRole, Resource: [!GetAtt McRole.Arn, !GetAtt ExecRole.Arn, !GetAtt TaskRole.Arn]}
+              - {Effect: Allow, Action: [events:PutTargets, events:PutRule, events:DescribeRule],
+                 Resource: [!Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForMediaConvertJobRule",
+                            !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule"]}
+  Pipeline:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${AWS::StackName}-pipeline"
+      RoleArn: !GetAtt SfnRole.Arn
+      DefinitionSubstitutions:
+        McRole: !GetAtt McRole.Arn
+        Cluster: !GetAtt Cluster.Arn
+        BeatTask: !Ref BeatTask
+        SegTask: !Ref SegTask
+        ConcatTask: !Ref ConcatTask
+        SubnetA: !Ref SubnetA
+        SubnetB: !Ref SubnetB
+        Sg: !Ref TaskSg
+        SegCount: !Ref SegmentCount
+      DefinitionString: |
+        {
+          "Comment": "transcode + beats",
+          "StartAt": "Fanout",
+          "States": {
+            "Fanout": {
+              "Type": "Parallel",
+              "End": true,
+              "Branches": [
+                {
+                  "StartAt": "MediaConvert",
+                  "States": {
+                    "MediaConvert": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::mediaconvert:createJob.sync",
+                      "Parameters": {
+                        "Role": "${McRole}",
+                        "Settings": {
+                          "Inputs": [{
+                            "FileInput.$": "States.Format('s3://{}/{}', $.bucket, $.key)",
+                            "AudioSelectors": {"Audio Selector 1": {"DefaultSelection": "DEFAULT"}},
+                            "VideoSelector": {},
+                            "TimecodeSource": "ZEROBASED"
+                          }],
+                          "OutputGroups": [{
+                            "Name": "File Group",
+                            "OutputGroupSettings": {
+                              "Type": "FILE_GROUP_SETTINGS",
+                              "FileGroupSettings": {"Destination.$": "States.Format('s3://{}/output/{}/mediaconvert/720p', $.bucket, $.id)"}
+                            },
+                            "Outputs": [{
+                              "ContainerSettings": {"Container": "MP4", "Mp4Settings": {"MoovPlacement": "PROGRESSIVE_DOWNLOAD"}},
+                              "VideoDescription": {
+                                "Width": 1280, "Height": 720,
+                                "CodecSettings": {"Codec": "H_264", "H264Settings": {
+                                  "RateControlMode": "QVBR", "QvbrSettings": {"QvbrQualityLevel": 7},
+                                  "MaxBitrate": 5000000, "FramerateControl": "INITIALIZE_FROM_SOURCE",
+                                  "SceneChangeDetect": "TRANSITION_DETECTION"}}
+                              },
+                              "AudioDescriptions": [{"CodecSettings": {"Codec": "AAC", "AacSettings": {
+                                "Bitrate": 128000, "CodingMode": "CODING_MODE_2_0", "SampleRate": 48000}}}]
+                            }]
+                          }]
+                        }
+                      },
+                      "ResultSelector": {"jobId.$": "$.Job.Id", "timing.$": "$.Job.Timing", "outputs.$": "$.Job.OutputGroupDetails"},
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "Beat",
+                  "States": {
+                    "Beat": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::ecs:runTask.sync",
+                      "Parameters": {
+                        "Cluster": "${Cluster}", "TaskDefinition": "${BeatTask}", "LaunchType": "FARGATE",
+                        "NetworkConfiguration": {"AwsvpcConfiguration": {"Subnets": ["${SubnetA}", "${SubnetB}"], "SecurityGroups": ["${Sg}"], "AssignPublicIp": "ENABLED"}},
+                        "Overrides": {"ContainerOverrides": [{"Name": "worker", "Environment": [
+                          {"Name": "MODE", "Value": "beat"},
+                          {"Name": "BUCKET", "Value.$": "$.bucket"},
+                          {"Name": "KEY", "Value.$": "$.key"},
+                          {"Name": "JOB_ID", "Value.$": "$.id"}]}]}
+                      },
+                      "ResultSelector": {"createdAt.$": "$.CreatedAt", "startedAt.$": "$.StartedAt", "stoppedAt.$": "$.StoppedAt", "cpu.$": "$.Cpu", "memory.$": "$.Memory"},
+                      "Retry": [{"ErrorEquals": ["ECS.AmazonECSException"], "IntervalSeconds": 10, "MaxAttempts": 5, "BackoffRate": 2}],
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "Slices",
+                  "States": {
+                    "Slices": {
+                      "Type": "Pass",
+                      "Parameters": {"bucket.$": "$.bucket", "key.$": "$.key", "id.$": "$.id", "segs.$": "States.ArrayRange(1, ${SegCount}, 1)"},
+                      "Next": "FfmpegSegments"
+                    },
+                    "FfmpegSegments": {
+                      "Type": "Map",
+                      "ItemsPath": "$.segs",
+                      "MaxConcurrency": 0,
+                      "ItemSelector": {"bucket.$": "$.bucket", "key.$": "$.key", "id.$": "$.id", "i.$": "States.Format('{}', $$.Map.Item.Value)"},
+                      "ItemProcessor": {
+                        "ProcessorConfig": {"Mode": "INLINE"},
+                        "StartAt": "Segment",
+                        "States": {
+                          "Segment": {
+                            "Type": "Task",
+                            "Resource": "arn:aws:states:::ecs:runTask.sync",
+                            "Parameters": {
+                              "Cluster": "${Cluster}", "TaskDefinition": "${SegTask}", "LaunchType": "FARGATE",
+                              "NetworkConfiguration": {"AwsvpcConfiguration": {"Subnets": ["${SubnetA}", "${SubnetB}"], "SecurityGroups": ["${Sg}"], "AssignPublicIp": "ENABLED"}},
+                              "Overrides": {"ContainerOverrides": [{"Name": "worker", "Environment": [
+                                {"Name": "MODE", "Value": "segment"},
+                                {"Name": "BUCKET", "Value.$": "$.bucket"},
+                                {"Name": "KEY", "Value.$": "$.key"},
+                                {"Name": "JOB_ID", "Value.$": "$.id"},
+                                {"Name": "SEG_INDEX", "Value.$": "$.i"},
+                                {"Name": "SEG_COUNT", "Value": "${SegCount}"}]}]}
+                            },
+                            "ResultSelector": {"createdAt.$": "$.CreatedAt", "startedAt.$": "$.StartedAt", "stoppedAt.$": "$.StoppedAt", "cpu.$": "$.Cpu", "memory.$": "$.Memory"},
+                            "Retry": [{"ErrorEquals": ["ECS.AmazonECSException"], "IntervalSeconds": 10, "MaxAttempts": 5, "BackoffRate": 2}],
+                            "End": true
+                          }
+                        }
+                      },
+                      "ResultPath": "$.segments",
+                      "Next": "Concat"
+                    },
+                    "Concat": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::ecs:runTask.sync",
+                      "Parameters": {
+                        "Cluster": "${Cluster}", "TaskDefinition": "${ConcatTask}", "LaunchType": "FARGATE",
+                        "NetworkConfiguration": {"AwsvpcConfiguration": {"Subnets": ["${SubnetA}", "${SubnetB}"], "SecurityGroups": ["${Sg}"], "AssignPublicIp": "ENABLED"}},
+                        "Overrides": {"ContainerOverrides": [{"Name": "worker", "Environment": [
+                          {"Name": "MODE", "Value": "concat"},
+                          {"Name": "BUCKET", "Value.$": "$.bucket"},
+                          {"Name": "KEY", "Value.$": "$.key"},
+                          {"Name": "JOB_ID", "Value.$": "$.id"}]}]}
+                      },
+                      "ResultSelector": {"createdAt.$": "$.CreatedAt", "startedAt.$": "$.StartedAt", "stoppedAt.$": "$.StoppedAt", "cpu.$": "$.Cpu", "memory.$": "$.Memory"},
+                      "ResultPath": "$.concat",
+                      "Retry": [{"ErrorEquals": ["ECS.AmazonECSException"], "IntervalSeconds": 10, "MaxAttempts": 5, "BackoffRate": 2}],
+                      "End": true
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+
+  # ---------- trigger: any object under input/ starts one execution ----------
+  TriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Statement: [{Effect: Allow, Principal: {Service: events.amazonaws.com}, Action: sts:AssumeRole}]}
+      Policies:
+        - PolicyName: start
+          PolicyDocument: {Statement: [{Effect: Allow, Action: states:StartExecution, Resource: !Ref Pipeline}]}
+  Trigger:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+        detail:
+          bucket: {name: [!Ref Bucket]}
+          object: {key: [{prefix: input/}]}
+      Targets:
+        - Id: sfn
+          Arn: !Ref Pipeline
+          RoleArn: !GetAtt TriggerRole.Arn
+          InputTransformer:
+            InputPathsMap: {b: $.detail.bucket.name, k: $.detail.object.key, id: $.id}
+            InputTemplate: '{"bucket": "<b>", "key": "<k>", "id": "<id>"}'
+
+Outputs:
+  BucketName: {Value: !Ref Bucket}
+  BuildProject: {Value: !Ref Build}
+  StateMachineArn: {Value: !Ref Pipeline}
