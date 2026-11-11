@@ -27,6 +27,7 @@ cd video-transcode-beat-poc
 
 - 换区域对比：把 `us-west-1` 换成 `us-west-2`，两边各部署一套，用同一个样片跑。
 - `SEGMENTS=16 ./deploy.sh ...` 可以调整路线 C 的切片数。
+- MediaConvert 默认开启 Accelerated transcoding（`PREFERRED`，按 Professional 档计费），4K/8K 源快很多；`ACCEL=DISABLED ./deploy.sh ...` 可以改回 Basic 档。
 - 报告的单价来自 AWS Price List API（2026-11-11，按需价），写在 `report.py` 里，报价前请对照官方价格页再核一遍。
 
 ## 输出

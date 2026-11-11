@@ -10,8 +10,11 @@ import boto3
 PRICES = {
     # MediaConvert Basic tier, AVC/H.264 HD output (720p counts as HD), single pass, $ per output minute by fps band
     # Fargate Linux/x86 on-demand: $ per vCPU-hour, $ per GB-hour
-    "us-west-1": {"mc_hd": {30: 0.017, 60: 0.0212, 120: 0.0255}, "vcpu": 0.04656, "gb": 0.00511},
-    "us-west-2": {"mc_hd": {30: 0.015, 60: 0.0188, 120: 0.0225}, "vcpu": 0.04048, "gb": 0.004445},
+    # mc_hd = Basic tier, mc_hd_pro = Professional tier (billed when Accelerated transcoding is used)
+    "us-west-1": {"mc_hd": {30: 0.017, 60: 0.0212, 120: 0.0255}, "mc_hd_pro": {30: 0.0272, 60: 0.034, 120: 0.0408},
+                  "vcpu": 0.04656, "gb": 0.00511},
+    "us-west-2": {"mc_hd": {30: 0.015, 60: 0.0188, 120: 0.0225}, "mc_hd_pro": {30: 0.024, 60: 0.03, 120: 0.036},
+                  "vcpu": 0.04048, "gb": 0.004445},
 }
 
 
@@ -36,6 +39,7 @@ def main():
     ap.add_argument("--region", required=True)
     ap.add_argument("--stack", default="beat-poc")
     ap.add_argument("--since", type=int, required=True, help="epoch seconds; only executions started after this")
+    ap.add_argument("--until", type=int, default=0, help="epoch seconds; ignore executions started after this")
     ap.add_argument("--expect", type=int, default=1)
     ap.add_argument("--per-day", type=int, default=500)
     a = ap.parse_args()
@@ -47,7 +51,7 @@ def main():
     print(f"== waiting for {a.expect} execution(s) on {sm.split(':')[-1]}")
     while True:
         ex = [e for e in sfn.list_executions(stateMachineArn=sm, maxResults=100)["executions"]
-              if e["startDate"].timestamp() >= a.since - 5]
+              if e["startDate"].timestamp() >= a.since - 5 and (not a.until or e["startDate"].timestamp() <= a.until)]
         done = [e for e in ex if e["status"] != "RUNNING"]
         print(f"   {len(done)}/{len(ex)} finished ({int(time.time() - a.since)} s)", flush=True)
         if len(ex) >= a.expect and len(done) == len(ex):
@@ -66,7 +70,8 @@ def main():
         bt = tim("beat")
         probe = bt["probe"]
         mins = mc["outputs"][0]["OutputDetails"][0]["DurationInMs"] / 60000
-        mc_cost = mins * p["mc_hd"][fps_band(probe["fps"])]
+        accel = mc.get("accelStatus") == "ACCELERATED"
+        mc_cost = mins * p["mc_hd_pro" if accel else "mc_hd"][fps_band(probe["fps"])]
         mc_secs = ts(mc["timing"]["FinishTime"]) - ts(mc["timing"]["SubmitTime"])
         beat_cost, beat_secs = fargate_cost(beat, p)
         seg = [fargate_cost(t, p) for t in ff["segments"]]
@@ -76,7 +81,7 @@ def main():
         rows.append(dict(job=job[:8], e2e=(d["stopDate"] - d["startDate"]).total_seconds(), mc=mc_secs, mc_cost=mc_cost,
                          beat=beat_secs, beat_infer=bt["inference_s"], beat_audio=bt["audio_extract_s"],
                          beat_cost=beat_cost, ff=ff_secs, ff_cost=ff_cost, probe=probe, mins=mins,
-                         n_beats=bt.get("n_beats"), segs=len(seg), beat_vcpu=int(beat["cpu"]) // 1024))
+                         n_beats=bt.get("n_beats"), accel=accel, segs=len(seg), beat_vcpu=int(beat["cpu"]) // 1024))
     if not rows:
         return
     m = lambda k: statistics.mean(r[k] for r in rows)
@@ -88,12 +93,13 @@ def main():
         "",
         "| Step | avg wall time (s) | $ / video | $ / month @ %d/day |" % a.per_day,
         "|---|---|---|---|",
-        f"| A. MediaConvert 720p (Basic) | {m('mc'):.0f} | {m('mc_cost'):.4f} | {m('mc_cost') * monthly:,.0f} |",
+        f"| A. MediaConvert 720p ({'Pro, accelerated' if rows[0]['accel'] else 'Basic'}) | {m('mc'):.0f} | {m('mc_cost'):.4f} | {m('mc_cost') * monthly:,.0f} |",
         f"| B. beat_this on Fargate {rows[0]['beat_vcpu']} vCPU (CPU only) | {m('beat'):.0f} (audio {m('beat_audio'):.0f}, model {m('beat_infer'):.0f}) | {m('beat_cost'):.4f} | {m('beat_cost') * monthly:,.0f} |",
         f"| C. ffmpeg x{rows[0]['segs']} slices + concat on Fargate | {m('ff'):.0f} | {m('ff_cost'):.4f} | {m('ff_cost') * monthly:,.0f} |",
         f"| End-to-end (A, B, C in parallel) | {m('e2e'):.0f} | | |",
         "",
-        f"Recommended path A+B: ${m('mc_cost') + m('beat_cost'):.4f}/video, ${(m('mc_cost') + m('beat_cost')) * monthly:,.0f}/month.",
+        f"Managed path A+B: ${m('mc_cost') + m('beat_cost'):.4f}/video, ${(m('mc_cost') + m('beat_cost')) * monthly:,.0f}/month; "
+        f"self-run path C+B: ${m('ff_cost') + m('beat_cost'):.4f}/video, ${(m('ff_cost') + m('beat_cost')) * monthly:,.0f}/month.",
         "Fargate times include task start-up (image pull); MediaConvert time is submit -> finish.",
         "Not included: S3 storage, Step Functions transitions (~$0.025 per 1k), CloudWatch logs - all small.",
     ]

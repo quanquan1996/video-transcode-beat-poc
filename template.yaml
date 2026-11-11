@@ -12,6 +12,11 @@ Parameters:
     Type: String
     Default: "8192"
     AllowedValues: ["2048", "4096", "8192", "16384"]
+  McAcceleration:
+    Type: String
+    Default: PREFERRED
+    AllowedValues: [DISABLED, PREFERRED, ENABLED]
+    Description: MediaConvert Accelerated transcoding (Professional tier) - much faster for 4K/8K sources.
   BeatCpu:
     Type: String
     Default: "4096"
@@ -201,6 +206,7 @@ Resources:
         SubnetB: !Ref SubnetB
         Sg: !Ref TaskSg
         SegCount: !Ref SegmentCount
+        McAccel: !Ref McAcceleration
       DefinitionString: |
         {
           "Comment": "transcode + beats",
@@ -218,7 +224,9 @@ Resources:
                       "Resource": "arn:aws:states:::mediaconvert:createJob.sync",
                       "Parameters": {
                         "Role": "${McRole}",
+                        "AccelerationSettings": {"Mode": "${McAccel}"},
                         "Settings": {
+                          "TimecodeConfig": {"Source": "ZEROBASED"},
                           "Inputs": [{
                             "FileInput.$": "States.Format('s3://{}/{}', $.bucket, $.key)",
                             "AudioSelectors": {"Audio Selector 1": {"DefaultSelection": "DEFAULT"}},
@@ -246,7 +254,7 @@ Resources:
                           }]
                         }
                       },
-                      "ResultSelector": {"jobId.$": "$.Job.Id", "timing.$": "$.Job.Timing", "outputs.$": "$.Job.OutputGroupDetails"},
+                      "ResultSelector": {"jobId.$": "$.Job.Id", "timing.$": "$.Job.Timing", "outputs.$": "$.Job.OutputGroupDetails", "accel.$": "$.Job.AccelerationSettings.Mode", "accelStatus.$": "$.Job.AccelerationStatus"},
                       "End": true
                     }
                   }
